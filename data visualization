@@ -1,0 +1,91 @@
+BG = '#0a0a0a'
+
+def mesh_tri(mesh):
+    mesh.topology.create_connectivity(2,0)
+    tris=np.array([mesh.topology.connectivity(2,0).links(i)
+                   for i in range(mesh.topology.index_map(2).size_local)])
+    x=mesh.geometry.x[:,0]*1e3; y=mesh.geometry.x[:,1]*1e3
+    return tri.Triangulation(x,y,tris)
+
+def map_to_nodes(fn_space, fn_vals, mesh_pts):
+    coords=fn_space.tabulate_dof_coordinates()[:,:2]
+    _,idx=cKDTree(coords).query(mesh_pts)
+    return fn_vals[idx]
+
+names  = list(CONFIGS.keys())
+labels = [CONFIGS[n]['label'] for n in names]
+
+# ── Plot 1: Velocity + Pressure (3×2) ──────────────────────
+fig,axes=plt.subplots(2,3,figsize=(20,12),facecolor=BG)
+fig.suptitle('Velocity & Pressure — 3 Configurations',
+             color='#ccc',fontsize=13,y=1.01)
+
+for col,(name,lbl) in enumerate(zip(names,labels)):
+    mesh,uh1,ph1,_,V1,P1s,_ = RESULTS[name]
+    tr = mesh_tri(mesh)
+    gpts = mesh.geometry.x[:,:2]
+
+    u_n = map_to_nodes(V1,
+          np.sqrt((uh1.x.array.reshape(-1,2)**2).sum(1))*1e3, gpts)
+    p_n = map_to_nodes(P1s, ph1.x.array, gpts)
+
+    for row,vals,cmap,lbl2 in [
+        (0, u_n, 'inferno', '|u| (mm/s)'),
+        (1, p_n, 'plasma',  'P (Pa)'),
+    ]:
+        ax=axes[row][col]
+        ax.set_facecolor(BG)
+        for sp in ax.spines.values(): sp.set_edgecolor('#333')
+        ax.tick_params(colors='#777',labelsize=8)
+        ax.xaxis.label.set_color('#777'); ax.yaxis.label.set_color('#777')
+        tc=ax.tripcolor(tr,vals,shading='gouraud',cmap=cmap)
+        cb=plt.colorbar(tc,ax=ax,fraction=0.046,pad=0.04)
+        cb.set_label(lbl2,color='#777',fontsize=8)
+        cb.ax.yaxis.set_tick_params(color='#777',labelcolor='#777')
+        ax.set_aspect('equal')
+        if row==0: ax.set_title(lbl,color='#ddd',fontsize=10,pad=6)
+        if row==1: ax.set_xlabel('x (mm)',fontsize=8)
+        ax.set_ylabel(['Velocity','Pressure'][row],color='#aaa',fontsize=9)
+
+plt.tight_layout()
+plt.savefig('results/comparison_velo_pressure.png',dpi=200,
+            bbox_inches='tight',facecolor=BG)
+plt.show()
+print("Saved: results/comparison_velo_pressure.png")
+
+# ── Plot 2: Species (3 configs × 3 species) ──────────────
+sp_names=['blood','PBS','substrate']
+sp_titles=['Blood (c₁)','PBS (c₂)','Substrate (c₃)']
+
+fig,axes=plt.subplots(3,3,figsize=(20,18),facecolor=BG)
+fig.suptitle('Species Concentration — 3 Configurations\n'
+             'Blood 150 · PBS 10 · Substrate 100  μL/min',
+             color='#ccc',fontsize=13,y=1.01)
+
+for col,(name,lbl) in enumerate(zip(names,labels)):
+    mesh,_,_,species,_,_,Qs = RESULTS[name]
+    tr = mesh_tri(mesh)
+    gpts = mesh.geometry.x[:,:2]
+
+    for row,(sp,sp_t) in enumerate(zip(sp_names,sp_titles)):
+        ax=axes[row][col]
+        ax.set_facecolor(BG)
+        for sp2 in ax.spines.values(): sp2.set_edgecolor('#333')
+        ax.tick_params(colors='#777',labelsize=8)
+        ax.xaxis.label.set_color('#777'); ax.yaxis.label.set_color('#777')
+
+        c_n=map_to_nodes(Qs,species[sp].x.array,gpts)
+        tc=ax.tripcolor(tr,c_n,shading='gouraud',cmap='inferno',vmin=0,vmax=1)
+        cb=plt.colorbar(tc,ax=ax,fraction=0.046,pad=0.04)
+        cb.set_label(f'c ({sp})',color='#777',fontsize=8)
+        cb.ax.yaxis.set_tick_params(color='#777',labelcolor='#777')
+        ax.set_aspect('equal')
+        if row==0: ax.set_title(lbl,color='#ddd',fontsize=10,pad=6)
+        if col==0: ax.set_ylabel(sp_t,color='#aaa',fontsize=9)
+        if row==2: ax.set_xlabel('x (mm)',fontsize=8)
+
+plt.tight_layout()
+plt.savefig('results/comparison_species.png',dpi=200,
+            bbox_inches='tight',facecolor=BG)
+plt.show()
+print("Saved: results/comparison_species.png")
