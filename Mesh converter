@@ -1,0 +1,32 @@
+import meshio, numpy as np, os
+SCALE = 1e-3  # mm → m
+os.makedirs('xdmf', exist_ok=True)
+
+for name, cfg in CONFIGS.items():
+    msh = meshio.read(cfg['msh'])
+
+    tri_idx  = [i for i,c in enumerate(msh.cells) if c.type=="triangle"]
+    line_idx = [i for i,c in enumerate(msh.cells) if c.type=="line"]
+
+    if not line_idx:
+        print(f"  WARNING: no line elements in {name}"); continue
+
+    tri_data  = np.vstack([msh.cells[i].data for i in tri_idx])
+    line_data = np.vstack([msh.cells[i].data for i in line_idx])
+    line_tags = np.hstack([msh.cell_data["gmsh:physical"][i]
+                           for i in line_idx]).astype(np.int32)
+
+    meshio.Mesh(
+        points=msh.points[:,:2]*SCALE,
+        cells=[("triangle", tri_data)],
+    ).write(f"xdmf/{name}.xdmf")
+
+    meshio.Mesh(
+        points=msh.points[:,:2]*SCALE,
+        cells=[("line", line_data)],
+        cell_data={"markers": [line_tags]},
+    ).write(f"xdmf/{name}_bnd.xdmf")
+
+    print(f"  ✓ {name}  tris:{len(tri_data)}  lines:{len(line_data)}"
+          f"  tags:{np.unique(line_tags)}")
+print("Done.")
