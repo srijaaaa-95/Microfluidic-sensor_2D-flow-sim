@@ -1,0 +1,139 @@
+def inlet_dir(mesh, facets, fdim):
+    """Inward flow direction = centroid → origin, normalised."""
+    if len(facets)==0: return np.array([1.,0.])
+    mids = dolfinx.mesh.compute_midpoints(mesh, fdim, facets)
+    cen  = mids.mean(axis=0)[:2]
+    d    = -cen
+    return d / np.linalg.norm(d)
+
+def solve_config(name, cfg):
+    print(f"\n{'='*50}\nSolving: {name}")
+
+    with dolfinx.io.XDMFFile(MPI.COMM_WORLD, f"xdmf/{name}.xdmf","r") as f:
+        mesh = f.read_mesh(name="Grid")
+
+    mesh.topology.create_connectivity(mesh.topology.dim-1, mesh.topology.dim)
+
+    with dolfinx.io.XDMFFile(MPI.COMM_WORLD, f"xdmf/{name}_bnd.xdmf","r") as f:
+        ft = f.read_meshtags(mesh, name="Grid")
+
+    fdim = mesh.topology.dim-1
+    gdim = mesh.geometry.dim
+
+    f1   = ft.indices[ft.values==10]   # Inlet_1  blood
+    f2   = ft.indices[ft.values==11]   # Inlet_2  PBS
+    f3   = ft.indices[ft.values==12]   # Inlet_3  substrate
+    fout = ft.indices[ft.values==20]   # Outlet
+    fw   = ft.indices[ft.values==30]   # Walls
+
+    print(f"  Tags — In1:{len(f1)} In2:{len(f2)} In3:{len(f3)} "
+          f"Out:{len(fout)} Wall:{len(fw)}")
+
+    if min(len(f1),len(f2),len(f3))==0:
+        print("  ERROR: inlet not found — check physical groups in .msh")
+        return None
+
+    # Flow directions from inlet centroids → origin
+    d1 = inlet_dir(mesh, f1, fdim)
+    d2 = inlet_dir(mesh, f2, fdim)
+    d3 = inlet_dir(mesh, f3, fdim)
+    print(f"  Dirs — blood:({d1[0]:.2f},{d1[1]:.2f})  "
+          f"PBS:({d2[0]:.2f},{d2[1]:.2f})  sub:({d3[0]:.2f},{d3[1]:.2f})")
+
+    # Function spaces
+    P2  = basix.ufl.element("Lagrange", mesh.basix_cell(), 2, shape=(gdim,))
+    P1e = basix.ufl.element("Lagrange", mesh.basix_cell(), 1)
+    W   = dolfinx.fem.functionspace(mesh, basix.ufl.mixed_element([P2,P1e]))
+    W0  = W.sub(0); V,_ = W0.collapse()
+
+    u,p = ufl.TrialFunctions(W); v,q = ufl.TestFunctions(W)
+    a = (MU*ufl.inner(ufl.grad(u),ufl.grad(v))
+         - ufl.inner(p,ufl.div(v))
+         - ufl.inner(ufl.div(u),q))*ufl.dx
+    L = ufl.inner(dolfinx.fem.Constant(
+        mesh,PETSc.ScalarType((0.,0.))),v)*ufl.dx
+
+    # BCs
+    uw=dolfinx.fem.Function(V); uw.x.array[:]=0.
+    bcs=[dolfinx.fem.dirichletbc(uw,
+         dolfinx.fem.locate_dofs_topological((W0,V),fdim,fw),W0)]
+
+    for facets,d,spd,lbl in [(f1,d1,U['blood'],'blood'),
+                              (f2,d2,U['PBS'],  'PBS'),
+                              (f3,d3,U['substrate'],'sub')]:
+        uf=dolfinx.fem.Function(V)
+        uf.interpolate(lambda x,d=d,s=spd: np.vstack([
+            np.full(x.shape[1],s*d[0]),
+            np.full(x.shape[1],s*d[1])]))
+        dofs=dolfinx.fem.locate_dofs_topological((W0,V),fdim,facets)
+        bcs.append(dolfinx.fem.dirichletbc(uf,dofs,W0))
+        print(f"  {lbl}: {spd*1e3:.0f} mm/s  dofs={len(dofs[0])}")
+
+    # Solve Stokes
+    af=dolfinx.fem.form(a); Lf=dolfinx.fem.form(L)
+    A=dolfinx.fem.petsc.assemble_matrix(af,bcs=bcs); A.assemble()
+    b=dolfinx.fem.petsc.assemble_vector(Lf)
+    dolfinx.fem.petsc.apply_lifting(b,[af],[bcs])
+    b.ghostUpdate(addv=PETSc.InsertMode.ADD,mode=PETSc.ScatterMode.REVERSE)
+    dolfinx.fem.petsc.set_bc(b,bcs)
+    ksp=PETSc.KSP().create(mesh.comm)
+    ksp.setOperators(A); ksp.setType("preonly")
+    ksp.getPC().setType("lu"); ksp.getPC().setFactorSolverType("mumps")
+    wh=dolfinx.fem.Function(W)
+    ksp.solve(b,wh.x.petsc_vec); wh.x.scatter_forward()
+    ksp.destroy(); A.destroy(); b.destroy()
+
+    uh=wh.sub(0).collapse(); ph=wh.sub(1).collapse()
+    u_mag=np.sqrt((uh.x.array.reshape(-1,gdim)**2).sum(1))
+    print(f"  Max|u|={u_mag.max()*1e3:.1f} mm/s  MaxP={ph.x.array.max():.1f} Pa")
+
+    V1 =dolfinx.fem.functionspace(mesh,("Lagrange",1,(gdim,)))
+    P1s=dolfinx.fem.functionspace(mesh,("Lagrange",1))
+    uh1=dolfinx.fem.Function(V1);  uh1.interpolate(uh)
+    ph1=dolfinx.fem.Function(P1s); ph1.interpolate(ph)
+
+    # Species transport
+    V2=dolfinx.fem.functionspace(mesh,("Lagrange",2,(gdim,)))
+    u_adv=dolfinx.fem.Function(V2); u_adv.interpolate(uh)
+    Qs=dolfinx.fem.functionspace(mesh,("Lagrange",1))
+    c=ufl.TrialFunction(Qs); w=ufl.TestFunction(Qs)
+    n=ufl.FacetNormal(mesh); h=ufl.CellDiameter(mesh)
+    umag=ufl.sqrt(ufl.dot(u_adv,u_adv)+1e-20); tau=h/(2.*umag)
+    un=ufl.dot(u_adv,n); un_m=0.5*(un-ufl.sqrt(un**2+1e-20**2))
+    a_ad=(D_SP*ufl.inner(ufl.grad(c),ufl.grad(w))
+         +ufl.inner(ufl.dot(u_adv,ufl.grad(c)),w)
+         +tau*ufl.inner(ufl.dot(u_adv,ufl.grad(c)),
+                        ufl.dot(u_adv,ufl.grad(w))))*ufl.dx+un_m*c*w*ufl.ds
+    L_ad=dolfinx.fem.Constant(mesh,PETSc.ScalarType(0.))*w*ufl.dx
+    a_adf=dolfinx.fem.form(a_ad); L_adf=dolfinx.fem.form(L_ad)
+
+    inlet_fac={'blood':f1,'PBS':f2,'substrate':f3}
+    species={}
+    for sname,sf in inlet_fac.items():
+        bcs_sp=[]
+        for sn2,sf2 in inlet_fac.items():
+            cbc=dolfinx.fem.Function(Qs)
+            cbc.x.array[:]=1. if sn2==sname else 0.
+            dofs=dolfinx.fem.locate_dofs_topological(Qs,fdim,sf2)
+            bcs_sp.append(dolfinx.fem.dirichletbc(cbc,dofs))
+        As=dolfinx.fem.petsc.assemble_matrix(a_adf,bcs=bcs_sp); As.assemble()
+        bs=dolfinx.fem.petsc.assemble_vector(L_adf)
+        dolfinx.fem.petsc.apply_lifting(bs,[a_adf],[bcs_sp])
+        bs.ghostUpdate(addv=PETSc.InsertMode.ADD,mode=PETSc.ScatterMode.REVERSE)
+        dolfinx.fem.petsc.set_bc(bs,bcs_sp)
+        ksp_s=PETSc.KSP().create(mesh.comm)
+        ksp_s.setOperators(As); ksp_s.setType("preonly")
+        ksp_s.getPC().setType("lu"); ksp_s.getPC().setFactorSolverType("mumps")
+        cs=dolfinx.fem.Function(Qs)
+        ksp_s.solve(bs,cs.x.petsc_vec); cs.x.scatter_forward()
+        cs.x.array[:]=np.clip(cs.x.array,0,1)
+        species[sname]=cs
+        ksp_s.destroy(); As.destroy(); bs.destroy()
+        print(f"  {sname}: max={cs.x.array.max():.3f}")
+
+    return mesh,uh1,ph1,species,V1,P1s,Qs
+
+RESULTS={}
+for name,cfg in CONFIGS.items():
+    RESULTS[name]=solve_config(name,cfg)
+print("\nAll 3 solved.")
