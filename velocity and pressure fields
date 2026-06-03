@@ -1,0 +1,50 @@
+import matplotlib.pyplot as plt
+import matplotlib.tri as tri
+
+# Actual mesh triangles
+mesh.topology.create_connectivity(2, 0)
+triangles = []
+for i in range(mesh.topology.index_map(2).size_local):
+    triangles.append(mesh.topology.connectivity(2, 0).links(i))
+triangles = np.array(triangles)
+
+x_mesh = mesh.geometry.x[:, 0] * 1e3
+y_mesh = mesh.geometry.x[:, 1] * 1e3
+triang_mesh = tri.Triangulation(x_mesh, y_mesh, triangles)
+
+# Compute velocity magnitude PER CELL (avoids DOF mismatch)
+u_arr = uh1.x.array.reshape(-1, gdim)
+u_mag_all = np.sqrt(u_arr[:,0]**2 + u_arr[:,1]**2) * 1e3
+
+# Map P1 DOF values to mesh nodes by nearest coordinate
+from scipy.spatial import cKDTree
+coords_v = V1.tabulate_dof_coordinates()[:, :gdim]
+mesh_pts = mesh.geometry.x[:, :gdim]
+tree = cKDTree(coords_v)
+_, idx = tree.query(mesh_pts)
+u_at_nodes = u_mag_all[idx]
+
+coords_p = P1s.tabulate_dof_coordinates()[:, :gdim]
+tree_p = cKDTree(coords_p)
+_, idx_p = tree_p.query(mesh_pts)
+p_at_nodes = ph1.x.array[idx_p]
+
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+ax = axes[0]
+tc = ax.tripcolor(triang_mesh, u_at_nodes, shading='gouraud', cmap='hot')
+plt.colorbar(tc, ax=ax, label='|u| (mm/s)')
+ax.set_aspect('equal')
+ax.set_title('Velocity magnitude')
+ax.set_xlabel('x (mm)'); ax.set_ylabel('y (mm)')
+
+ax2 = axes[1]
+tc2 = ax2.tripcolor(triang_mesh, p_at_nodes, shading='gouraud', cmap='coolwarm')
+plt.colorbar(tc2, ax=ax2, label='Pressure (Pa)')
+ax2.set_aspect('equal')
+ax2.set_title('Pressure field')
+ax2.set_xlabel('x (mm)'); ax2.set_ylabel('y (mm)')
+
+plt.tight_layout()
+plt.savefig("results/cfg13_flow_field.png", dpi=200, bbox_inches='tight')
+plt.show()
