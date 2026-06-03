@@ -1,0 +1,148 @@
+# ── Physical parameters (SI) ─────────────────────────────
+MU       = 3.5e-3      # Pa.s — blood viscosity (Newtonian first pass)
+DEPTH    = 100e-6       # m
+CH_W     = 0.30e-3      # m (0.30 mm from geometry)
+Q_BLOOD  = 100e-9/60    # m³/s
+Q_PBS    =  50e-9/60    # m³/s
+U_BLOOD  = Q_BLOOD / (CH_W * DEPTH)
+U_PBS    = Q_PBS   / (CH_W * DEPTH)
+print(f"Blood: {U_BLOOD*1e3:.1f} mm/s  |  PBS/Sub: {U_PBS*1e3:.1f} mm/s")
+
+# ── Load mesh ─────────────────────────────────────────────
+with dolfinx.io.XDMFFile(MPI.COMM_WORLD, "xdmf/cfg13.xdmf", "r") as f:
+    mesh = f.read_mesh(name="Grid")
+gdim = mesh.geometry.dim
+
+# ── Function spaces ───────────────────────────────────────
+P2  = basix.ufl.element("Lagrange", mesh.basix_cell(), 2, shape=(gdim,))
+P1  = basix.ufl.element("Lagrange", mesh.basix_cell(), 1)
+W   = dolfinx.fem.functionspace(mesh, basix.ufl.mixed_element([P2, P1]))
+W0  = W.sub(0)
+V, _ = W0.collapse()
+
+u, p = ufl.TrialFunctions(W)
+v, q = ufl.TestFunctions(W)
+
+a = (MU * ufl.inner(ufl.grad(u), ufl.grad(v))
+     - ufl.inner(p, ufl.div(v))
+     - ufl.inner(ufl.div(u), q)) * ufl.dx
+L = ufl.inner(dolfinx.fem.Constant(
+    mesh, PETSc.ScalarType((0.0, 0.0))), v) * ufl.dx
+
+# ── Classify boundary facets by LOCATION ──────────────────
+fdim = mesh.topology.dim - 1
+mesh.topology.create_connectivity(fdim, mesh.topology.dim)
+bfacets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+midpts  = dolfinx.mesh.compute_midpoints(mesh, fdim, bfacets)
+
+# Inlet tip positions (in m)
+t1 = np.array([-3.000e-3,  0.000e-3])   # Inlet_1
+t2 = np.array([-2.121e-3, -2.121e-3])   # Inlet_2
+t3 = np.array([ 0.776e-3, -2.898e-3])   # Inlet_3
+
+# Outlet disk centre (in m)
+ox, oy = 1.268e-3, 2.719e-3
+oR = 0.7e-3
+
+# Classify each facet
+tol_in  = CH_W * 2.0
+tol_out = oR * 1.4
+
+in1_mask = np.hypot(midpts[:,0]-t1[0], midpts[:,1]-t1[1]) < tol_in
+in2_mask = np.hypot(midpts[:,0]-t2[0], midpts[:,1]-t2[1]) < tol_in
+in3_mask = np.hypot(midpts[:,0]-t3[0], midpts[:,1]-t3[1]) < tol_in
+out_mask = np.hypot(midpts[:,0]-ox,    midpts[:,1]-oy)    < tol_out
+
+# Walls = everything NOT inlet or outlet
+wall_mask = ~(in1_mask | in2_mask | in3_mask | out_mask)
+
+in1_facets  = bfacets[in1_mask]
+in2_facets  = bfacets[in2_mask]
+in3_facets  = bfacets[in3_mask]
+wall_facets = bfacets[wall_mask]
+out_facets  = bfacets[out_mask]
+
+print(f"Facets — In1:{in1_mask.sum()} In2:{in2_mask.sum()} "
+      f"In3:{in3_mask.sum()} Out:{out_mask.sum()} Wall:{wall_mask.sum()}")
+
+# ── No-slip walls (NOT on outlet) ─────────────────────────
+u_wall = dolfinx.fem.Function(V)
+u_wall.x.array[:] = 0.0
+wall_dofs = dolfinx.fem.locate_dofs_topological((W0, V), fdim, wall_facets)
+bc_wall = dolfinx.fem.dirichletbc(u_wall, wall_dofs, W0)
+
+# ── Flow directions (tip → origin) ───────────────────────
+origin = np.array([0.0, 0.0])
+tips_m = np.array([t1, t2, t3])
+dirs = [(origin - t) / np.linalg.norm(origin - t) for t in tips_m]
+
+# ── Inlet BCs ─────────────────────────────────────────────
+bcs = [bc_wall]
+
+for k, (facets, d, u_mag, label) in enumerate([
+    (in1_facets, dirs[0], U_BLOOD, "Blood"),
+    (in2_facets, dirs[1], U_PBS,   "PBS"),
+    (in3_facets, dirs[2], U_PBS,   "Substrate"),
+]):
+    if len(facets) == 0:
+        print(f"  WARNING: no facets found for {label}")
+        continue
+    u_fn = dolfinx.fem.Function(V)
+    u_fn.interpolate(lambda x, d=d, u=u_mag: np.vstack([
+        np.full(x.shape[1], u * d[0]),
+        np.full(x.shape[1], u * d[1])]))
+    dofs = dolfinx.fem.locate_dofs_topological((W0, V), fdim, facets)
+    bcs.append(dolfinx.fem.dirichletbc(u_fn, dofs, W0))
+    print(f"  {label}: {len(dofs[0])} dofs, u=({u_mag*d[0]*1e3:.1f}, {u_mag*d[1]*1e3:.1f}) mm/s")
+
+# ── Outlet: NO BC → natural zero-traction (free outflow) ──
+print(f"  Outlet: {out_mask.sum()} facets — free outflow (no Dirichlet)")
+
+# ── Assemble + solve ──────────────────────────────────────
+a_f = dolfinx.fem.form(a)
+L_f = dolfinx.fem.form(L)
+A = dolfinx.fem.petsc.assemble_matrix(a_f, bcs=bcs); A.assemble()
+b = dolfinx.fem.petsc.assemble_vector(L_f)
+dolfinx.fem.petsc.apply_lifting(b, [a_f], [bcs])
+b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+dolfinx.fem.petsc.set_bc(b, bcs)
+
+ksp = PETSc.KSP().create(mesh.comm)
+ksp.setOperators(A)
+ksp.setType("preonly")
+ksp.getPC().setType("lu")
+ksp.getPC().setFactorSolverType("mumps")
+
+wh = dolfinx.fem.Function(W)
+ksp.solve(b, wh.x.petsc_vec)
+wh.x.scatter_forward()
+
+# ── Extract results ───────────────────────────────────────
+uh = wh.sub(0).collapse()
+ph = wh.sub(1).collapse()
+
+u_arr = uh.x.array.reshape(-1, gdim)
+u_mag = np.sqrt(u_arr[:,0]**2 + u_arr[:,1]**2)
+
+print(f"\n=== RESULTS ===")
+print(f"Max velocity:  {u_mag.max()*1e3:.2f} mm/s")
+print(f"Mean velocity: {u_mag.mean()*1e3:.2f} mm/s")
+print(f"Max pressure:  {ph.x.array.max():.4f} Pa")
+print(f"Min pressure:  {ph.x.array.min():.4f} Pa")
+
+# ── Save for ParaView ─────────────────────────────────────
+V1  = dolfinx.fem.functionspace(mesh, ("Lagrange", 1, (gdim,)))
+P1s = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+uh1 = dolfinx.fem.Function(V1);  uh1.name = "velocity"
+ph1 = dolfinx.fem.Function(P1s); ph1.name = "pressure"
+uh1.interpolate(uh)
+ph1.interpolate(ph)
+
+os.makedirs("results", exist_ok=True)
+with dolfinx.io.XDMFFile(MPI.COMM_WORLD, "results/cfg13_velocity.xdmf", "w") as f:
+    f.write_mesh(mesh); f.write_function(uh1)
+with dolfinx.io.XDMFFile(MPI.COMM_WORLD, "results/cfg13_pressure.xdmf", "w") as f:
+    f.write_mesh(mesh); f.write_function(ph1)
+print("Saved to results/")
+
+ksp.destroy(); A.destroy(); b.destroy()
