@@ -1,0 +1,101 @@
+INLET_VELOCITY = 1e-3   # m/s
+MU = 1e-3               # Pa.s water
+
+# Inlet tip coordinates from mesh inspection:
+# Arm1 (left):       x ~ -3.40
+# Arm3 (lower-left): x < -1.5 AND y < -1.5
+# Arm4 (lower-right):y ~ -3.32
+
+def inlet_region(x):
+    r1 = x[0] < -3.30                        # left arm tip
+    r2 = (x[0] < -1.5) & (x[1] < -1.5)      # lower-left arm tip
+    r3 = (x[0] > -0.5) & (x[1] < -3.10)     # lower-right arm tip
+    return r1 | r2 | r3
+
+results = []
+
+for xdmf_path in sorted(glob.glob("xdmf/*.xdmf")):
+    name = os.path.splitext(os.path.basename(xdmf_path))[0]
+    print(f"Solving: {name} ...", end=" ")
+
+    with dolfinx.io.XDMFFile(MPI.COMM_WORLD, xdmf_path, "r") as f:
+        mesh = f.read_mesh(name="Grid")
+
+    gdim = mesh.geometry.dim
+    P2   = basix.ufl.element("Lagrange", mesh.basix_cell(), 2, shape=(gdim,))
+    P1   = basix.ufl.element("Lagrange", mesh.basix_cell(), 1)
+    W    = dolfinx.fem.functionspace(mesh, basix.ufl.mixed_element([P2, P1]))
+    W0   = W.sub(0)
+    V, _ = W0.collapse()
+
+    u, p = ufl.TrialFunctions(W)
+    v, q = ufl.TestFunctions(W)
+
+    a = (MU * ufl.inner(ufl.grad(u), ufl.grad(v))
+         - ufl.inner(p, ufl.div(v))
+         - ufl.inner(ufl.div(u), q)) * ufl.dx
+    L = ufl.inner(dolfinx.fem.Constant(
+        mesh, PETSc.ScalarType((0.0, 0.0))), v) * ufl.dx
+
+    fdim = mesh.topology.dim - 1
+    mesh.topology.create_connectivity(fdim, mesh.topology.dim)
+    bfacets = dolfinx.mesh.exterior_facet_indices(mesh.topology)
+
+    # No-slip
+    u_zero = dolfinx.fem.Function(V)
+    u_zero.x.array[:] = 0.0
+    wall_dofs = dolfinx.fem.locate_dofs_topological((W0, V), fdim, bfacets)
+    bc_wall   = dolfinx.fem.dirichletbc(u_zero, wall_dofs, W0)
+
+    # Inlet
+    u_in = dolfinx.fem.Function(V)
+    u_in.interpolate(lambda x: np.vstack([
+        np.full(x.shape[1], INLET_VELOCITY),
+        np.zeros(x.shape[1])]))
+    inlet_dofs = dolfinx.fem.locate_dofs_geometrical((W0, V), inlet_region)
+    bc_inlet   = dolfinx.fem.dirichletbc(u_in, inlet_dofs, W0)
+
+    bcs = [bc_wall, bc_inlet]
+
+    a_f = dolfinx.fem.form(a)
+    L_f = dolfinx.fem.form(L)
+    A   = dolfinx.fem.petsc.assemble_matrix(a_f, bcs=bcs); A.assemble()
+    b   = dolfinx.fem.petsc.assemble_vector(L_f)
+    dolfinx.fem.petsc.apply_lifting(b, [a_f], [bcs])
+    b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+    dolfinx.fem.petsc.set_bc(b, bcs)
+
+    ksp = PETSc.KSP().create(mesh.comm)
+    ksp.setOperators(A)
+    ksp.setType("preonly")
+    ksp.getPC().setType("lu")
+    ksp.getPC().setFactorSolverType("mumps")
+    wh  = dolfinx.fem.Function(W)
+    ksp.solve(b, wh.x.petsc_vec)
+    wh.x.scatter_forward()
+
+     # Interpolate P2 velocity → P1 for XDMF output
+    V1  = dolfinx.fem.functionspace(mesh, ("Lagrange", 1, (gdim,)))
+    P1s = dolfinx.fem.functionspace(mesh, ("Lagrange", 1))
+    uh  = dolfinx.fem.Function(V1);  uh.name = "velocity"
+    ph  = dolfinx.fem.Function(P1s); ph.name = "pressure"
+
+    u_collapsed = wh.sub(0).collapse()
+    p_collapsed = wh.sub(1).collapse()
+    uh.interpolate(u_collapsed)
+    ph.interpolate(p_collapsed)
+
+    max_u = np.max(np.abs(uh.x.array))
+    print(f"OK  max|u|={max_u:.3e} m/s")
+    results.append((name, max_u))
+
+    for path, fn in [(f"results/{name}_velocity.xdmf", uh),
+                     (f"results/{name}_pressure.xdmf", ph)]:
+        with dolfinx.io.XDMFFile(MPI.COMM_WORLD, path, "w") as f:
+            f.write_mesh(mesh); f.write_function(fn)
+
+    ksp.destroy(); A.destroy(); b.destroy()
+
+print("\n=== Summary ===")
+for n, u in results:
+    print(f"  {n:40s}  max|u|={u:.3e}")
