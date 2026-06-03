@@ -1,0 +1,48 @@
+from scipy.spatial import cKDTree
+
+# Map Carreau velocity to mesh nodes
+V1_c = dolfinx.fem.functionspace(mesh, ("Lagrange", 1, (gdim,)))
+uh1_c = dolfinx.fem.Function(V1_c)
+uh1_c.interpolate(uh_c)
+
+coords_vc = V1_c.tabulate_dof_coordinates()[:, :gdim]
+u_out_c = uh1_c.x.array.reshape(-1, gdim)
+u_mag_c = np.sqrt(u_out_c[:,0]**2 + u_out_c[:,1]**2) * 1e3
+
+tree_c = cKDTree(coords_vc)
+_, idx_c = tree_c.query(mesh.geometry.x[:, :gdim])
+u_at_nodes_c = u_mag_c[idx_c]
+
+# Viscosity per cell → map to nodes (cell average to nearest node)
+DG0 = dolfinx.fem.functionspace(mesh, ("DG", 0))
+mu_vals = mu_field.x.array * 1e3  # mPa.s
+
+fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+
+# Carreau velocity
+ax = axes[0]
+tc = ax.tripcolor(triang_mesh, u_at_nodes_c, shading='gouraud', cmap='hot')
+plt.colorbar(tc, ax=ax, label='|u| (mm/s)')
+ax.set_aspect('equal')
+ax.set_title('Carreau — Velocity')
+ax.set_xlabel('x (mm)'); ax.set_ylabel('y (mm)')
+
+# Newtonian velocity (from Cell 3)
+ax2 = axes[1]
+tc2 = ax2.tripcolor(triang_mesh, u_at_nodes, shading='gouraud', cmap='hot')
+plt.colorbar(tc2, ax=ax2, label='|u| (mm/s)')
+ax2.set_aspect('equal')
+ax2.set_title('Newtonian — Velocity')
+ax2.set_xlabel('x (mm)'); ax2.set_ylabel('y (mm)')
+
+# Viscosity field (cell-wise)
+ax3 = axes[2]
+tc3 = ax3.tripcolor(triang_mesh, mu_vals, shading='flat', cmap='viridis')
+plt.colorbar(tc3, ax=ax3, label='μ (mPa·s)')
+ax3.set_aspect('equal')
+ax3.set_title('Carreau — Viscosity field')
+ax3.set_xlabel('x (mm)'); ax3.set_ylabel('y (mm)')
+
+plt.tight_layout()
+plt.savefig("results/cfg13_carreau_comparison.png", dpi=200, bbox_inches='tight')
+plt.show()
