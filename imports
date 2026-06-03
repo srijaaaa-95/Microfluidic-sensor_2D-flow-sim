@@ -1,0 +1,10 @@
+import dolfinx, dolfinx.io, dolfinx.fem, dolfinx.fem.petsc
+import basix.ufl, ufl
+from mpi4py import MPI
+from petsc4py import PETSc
+import numpy as np
+import meshio, os
+from scipy.spatial import cKDTree
+import matplotlib.pyplot as plt
+import matplotlib.tri as tri
+print("Ready:", dolfinx.__version__)
